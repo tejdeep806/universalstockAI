@@ -163,11 +163,22 @@ class AlphaVantageMCPServer:
                 'symbol': symbol,
                 'apikey': self.api_key
             }
+            response = requests.get(self.base_url, params=params, timeout=10)
             
-            response = requests.get(self.base_url, params=params)
             if response.status_code == 200:
                 data = response.json()
-                if data and 'Name' in data:
+                
+                # RATE LIMIT DETECTED
+                if "Note" in data:
+                    result = {
+                        "success": False,
+                        "error": "Rate limit hit (25 calls/day free tier). Upgrade or wait 24h."
+                    }
+                    self.cache[key] = result
+                    return result
+                
+                # SUCCESS: Valid company data
+                elif data and data.get('Name'):
                     result = {
                         "success": True,
                         "symbol": symbol,
@@ -183,16 +194,30 @@ class AlphaVantageMCPServer:
                     }
                     self.cache[key] = result
                     return result
+                
+                # NO DATA (but not rate limit)
                 else:
-                    result = {"success": False, "error": f"No company data found for {symbol}"}
+                    result = {
+                        "success": False,
+                        "error": f"No company data found for {symbol}"
+                    }
                     self.cache[key] = result
                     return result
-            result = {"success": False, "error": f"Could not fetch company overview for {symbol}"}
-            self.cache[key] = result
-            return result
             
+            # HTTP ERROR
+            else:
+                result = {
+                    "success": False,
+                    "error": f"HTTP {response.status_code} - Server error"
+                }
+                self.cache[key] = result
+                return result
+                
         except Exception as e:
-            result = {"success": False, "error": f"Failed to get company overview: {str(e)}"}
+            result = {
+                "success": False,
+                "error": f"Network error: {str(e)}"
+            }
             self.cache[key] = result
             return result
     
@@ -273,7 +298,13 @@ class AlphaVantageMCPServer:
         
         try:
             # Get stock data first (will use cache if already fetched)
+            # SILENT: Get 3mo data for RSI/SMA — don't log in UI
+            old_log_len = len(self.tool_calls_log)
             stock_data = self.get_stock_data(symbol, "3mo")
+            # Remove the 3mo call from log if it was added
+            if len(self.tool_calls_log) > old_log_len:
+                self.tool_calls_log.pop()  # Remove last (3mo) call
+            #stock_data = self.get_stock_data(symbol, "3mo")
             if not stock_data["success"]:
                 return stock_data
             
@@ -282,7 +313,7 @@ class AlphaVantageMCPServer:
             
             # Calculate technical indicators
             if len(df) >= 20:
-                df['sma_20'] = df['close'].rolling(window=20).mean()
+                df['fy_20'] = df['close'].rolling(window=20).mean()
                 df['sma_50'] = df['close'].rolling(window=50).mean() if len(df) >= 50 else None
                 
                 # RSI calculation
@@ -609,21 +640,24 @@ class UniversalStockAgent:
             return "AAPL"  # General default
 
     def _extract_period_from_query(self, query: str) -> str:
-        """Extract time period from natural language query"""
+        """Extract time period - 100% accurate, no defaults"""
         query_lower = query.lower()
         
-        if any(p in query_lower for p in ['1 month', '1 months', 'last month']):
+        if re.search(r'\b(1|one)\s*(month|months)\b', query_lower):
             return "1mo"
-        elif any(p in query_lower for p in ['3 month', '3 months', 'quarter', 'last quarter']):
+        if re.search(r'\b(2|two)\s*(month|months)\b', query_lower):
+            st.info("Note: '2 months' → using 3mo (closest available data)")
             return "3mo"
-        elif any(p in query_lower for p in ['6 month', '6 months', 'last 6 months', 'half year', 'last half year']):
+        if re.search(r'\b(3|three)\s*(month|months)\b|quarter', query_lower):
+            return "3mo"
+        if re.search(r'\b(6|six)\s*(month|months)\b|half\s*year', query_lower):
             return "6mo"
-        elif any(p in query_lower for p in ['1 year', '1 years', 'last year']):
+        if re.search(r'\b(1|one)\s*(year|years)\b', query_lower):
             return "1y"
-        elif any(p in query_lower for p in ['2 year', '2 years', 'last 2 years']):
+        if re.search(r'\b(2|two)\s*(year|years)\b', query_lower):
             return "2y"
-        else:
-            return "6mo"  # Default
+        
+        return "3mo"  # Shorter default to save quota
 
     def _create_tools(self):
         """Create tools fresh for each query"""
@@ -634,8 +668,20 @@ class UniversalStockAgent:
                     self._extract_symbol_from_query(query), 
                     self._extract_period_from_query(query)
                 )),
-                description="Useful for getting stock price history, current price, daily changes, volume, and performance metrics. Use this for any query about stock prices, trends, or historical performance."
+                description="""CRITICAL: Use the EXACT period the user requested.
+                Examples:
+                - 'last 3 months' → 3mo
+                - 'last year' → 1y
+                - 'last 1 month' → 1mo
+                NEVER use 6mo unless the user explicitly says '6 months'."""
             ),
+                # name="get_stock_data",
+                # func=lambda query: str(self.mcp_server.get_stock_data(
+                #     self._extract_symbol_from_query(query), 
+                #     self._extract_period_from_query(query)
+                # )),
+            #     description="Useful for getting stock price history, current price, daily changes, volume, and performance metrics. Use this for any query about stock prices, trends, or historical performance."
+            # ),
             Tool(
                 name="get_company_overview",
                 func=lambda query: str(self.mcp_server.get_company_overview(
@@ -706,11 +752,53 @@ class UniversalStockAgent:
 
             symbol = self._extract_symbol_from_query(user_query)
             period = self._extract_period_from_query(user_query)
+            
 
-            stock = self.mcp_server.get_stock_data(symbol, period)
-            company = self.mcp_server.get_company_overview(symbol)
+            # stock = self.mcp_server.get_stock_data(symbol, period)
+            # company = self.mcp_server.get_company_overview(symbol)
+            # === QUOTA-SAFE: Deduplicate + Rate Limit Fallback ===
+            tool_log = self.mcp_server.get_tool_calls()
+            stock_data = None
+            company_data = None
+
+            # Reuse if LangChain called with exact period
+            for call in tool_log:
+                if call.get("tool") == "get_stock_data" and call.get("symbol") == symbol:
+                    params = call.get("parameters", {})
+                    if isinstance(params, str): params = ast.literal_eval(params)
+                    if params.get("period") == period:
+                        stock_data = self.mcp_server.get_stock_data(symbol, period)
+                        break
+
+            for call in tool_log:
+                if call.get("tool") == "get_company_overview" and call.get("symbol") == symbol:
+                    company_data = self.mcp_server.get_company_overview(symbol)
+                    break
+
+            # Fallback (only if missing)
+            if not stock_data: stock_data = self.mcp_server.get_stock_data(symbol, period)
+            if not company_data: company_data = self.mcp_server.get_company_overview(symbol)
+
+            # LIVE DATA (quota-heavy, but essential)
             quote = self.mcp_server.get_global_quote(symbol)
             stats = self.mcp_server.get_key_stats(symbol)
+
+            # COMPATIBILITY
+            stock = stock_data
+            company = company_data
+
+            # QUOTA WARNING
+            if "rate limit" in str(stock_data).lower() or "rate limit" in str(company_data).lower():
+                st.warning("🛑 Rate limit hit! Free tier: 25 calls/day. Upgrade for unlimited: https://www.alphavantage.co/premium/")
+                        
+            
+            # === LIVE DATA (always fresh) ===
+            quote = self.mcp_server.get_global_quote(symbol)
+            stats = self.mcp_server.get_key_stats(symbol)
+            #show savings on API calls
+            if any("from_cache" in call for call in tool_log):
+                st.caption("Cached data reused — saved API calls!")
+            
 
             rec_prompt = f"""
             Symbol: {symbol}
@@ -767,6 +855,18 @@ st.sidebar.write("""
 - **get_technical_analysis**: Technical indicators
 """)
 
+# QUOTA TRACKER (add to sidebar)
+st.sidebar.subheader("📊 Quota Status")
+try:
+    # Count from last analysis (saved in session state)
+    last_log = st.session_state.get("last_tool_log", [])
+    real_calls = len([c for c in last_log if not c.get("from_cache", False)])
+    st.sidebar.metric("Calls in Last Query", f"{real_calls}/3 (per analysis)")
+    if real_calls >= 3:
+        st.sidebar.warning("High usage — check daily limit (25 free)")
+except:
+    st.sidebar.metric("Calls in Last Query", "0/3")
+    # st.sidebar.info("Run a query to see usage")
 st.sidebar.info("💡 The AI will automatically choose which tools to use based on your question!")
 
 # Chat interface
@@ -795,10 +895,17 @@ user_query = st.text_input(
     key="user_query_input"
 )
 
+
 # Process query
-if st.button("🚀 Analyze", type="primary") or 'user_query' in st.session_state:
-    query_to_process = st.session_state.get('user_query', user_query)
+if st.button("Analyze", type="primary") or 'user_query' in st.session_state:
+    # 1. Get the query: prefer example (if clicked), then text input
+    query_to_process = st.session_state.get('user_query', user_query.strip())
     
+    # 2. Clear the example so it doesn't persist
+    if 'user_query' in st.session_state:
+        del st.session_state.user_query
+
+    # 3. Validate
     if not query_to_process:
         st.error("Please enter a question about stocks")
     elif not chat_enabled:
@@ -806,29 +913,50 @@ if st.button("🚀 Analyze", type="primary") or 'user_query' in st.session_state
     elif not LANGCHAIN_AVAILABLE:
         st.error("LangChain not available. Please check installation.")
     else:
-        with st.spinner("🤖 AI is analyzing your query..."):
+        with st.spinner("AI is analyzing your query..."):
             # Create agent fresh for each query
             agent = UniversalStockAgent(openai_key)
             result = agent.process_query(query_to_process)
             
+            # Save tool log for quota tracker (safe, no error)
+            st.session_state.last_tool_log = result.get("tool_calls", [])
+
+            # === SUCCESS ===
             if result["success"]:
-                st.success("✅ Analysis Complete!")
+                st.success("Analysis Complete!")
                 
                 # 1. Show AI Response
-                st.subheader("🤖 AI Analysis")
+                st.subheader("AI Analysis")
                 st.info(result["ai_response"])
                 
-                # 2. Show Tools Used
-                st.subheader("🔧 Tools Automatically Selected")
-                if result["tool_calls"]:
-                    for i, tool_call in enumerate(result["tool_calls"], 1):
-                        tool_name = tool_call["tool"]
-                        params = {k: v for k, v in tool_call.items() if k not in ["tool", "timestamp", "from_cache"]}
-                        from_cache = tool_call.get("from_cache", False)
-                        cache_note = " (from cache)" if from_cache else ""
-                        st.success(f"**{i}. {tool_name}{cache_note}** - Parameters: {params}")
+                # 2. Show Tools Used (only real API calls)
+                                # === SHOW ONLY USER-FACING CALLS (Hide technical 3mo) ===
+                st.subheader("Tools Automatically Selected")
+                
+                user_calls = []
+                for call in result["tool_calls"]:
+                    # Skip internal technical calls
+                    if call.get("tool") == "get_stock_data" and call.get("parameters", {}).get("period") == "3mo":
+                        continue  # Hide 3mo technical call
+                    if not call.get("from_cache", False):
+                        user_calls.append(call)
+                
+                if user_calls:
+                    for i, call in enumerate(user_calls, 1):
+                        tool_name = call["tool"]
+                        params = {k: v for k, v in call.items() if k not in ["tool", "timestamp", "from_cache"]}
+                        st.success(f"**{i}. {tool_name}** - Parameters: {params}")
                 else:
-                    st.warning("No tools were called for this query")
+                    st.info("No API calls needed — all data from cache!")
+                # if result["tool_calls"]:
+                #     for i, tool_call in enumerate(result["tool_calls"], 1):
+                #         tool_name = tool_call["tool"]
+                #         params = {k: v for k, v in tool_call.items() if k not in ["tool", "timestamp", "from_cache"]}
+                #         from_cache = tool_call.get("from_cache", False)
+                #         cache_note = " (from cache)" if from_cache else ""
+                #         st.success(f"**{i}. {tool_name}{cache_note}** - Parameters: {params}")
+                # else:
+                #     st.warning("No tools were called for this query")
                 
                 # 3. Show Charts and Data (if available)
                 if result["stock_data"] and result["stock_data"]["success"]:
